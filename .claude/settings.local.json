@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(gh issue create --title 'Monorepo scaffold + Docker Compose' --body ' *)",
+      "Bash(gh issue create --title 'PostgreSQL schema + seed data' --body ' *)",
+      "Bash(gh issue create --title 'NestJS api-gateway: Products endpoints' --body ' *)",
+      "Bash(gh issue create --title 'Auth: register, login, logout with JWT + Redis sessions' --body ' *)",
+      "Bash(gh issue create --title 'Orders endpoint \\(place order + order history\\)' --body ' *)",
+      "Bash(gh issue create --title 'Redis caching layer \\(product listing, product detail, session store\\)' --body ' *)",
+      "Bash(gh issue create --title 'RabbitMQ 3-step order processing pipeline' --body ' *)",
+      "Bash(gh issue create --title 'NestJS health endpoint \\(queue depth, cache stats, slow query metrics\\)' --body ' *)",
+      "Bash(gh issue create --title 'Angular store UI \\(listing, config, checkout, order history\\)' --body ' *)",
+      "Bash(gh issue create --title 'ELK stack integration \\(Winston → Logstash → Elasticsearch\\)' --body ' *)"
+    ]
+  }
+}

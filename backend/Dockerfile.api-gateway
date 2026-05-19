@@ -1,0 +1,44 @@
+# =============================================================================
+# Dockerfile — api-gateway
+# =============================================================================
+# Multi-stage build:
+#   Stage 1 (builder): install deps + compile TypeScript → JavaScript
+#   Stage 2 (runner):  copy only compiled output, no dev dependencies
+#
+# Why multi-stage? The final image is much smaller — no TypeScript compiler,
+# no source maps, no test files. Faster to pull and run in production.
+# =============================================================================
+
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy package files first — Docker caches this layer
+# If only source code changes (not package.json), npm install is skipped on rebuild
+COPY package*.json ./
+COPY nest-cli.json ./
+COPY tsconfig*.json ./
+
+RUN npm ci --legacy-peer-deps
+
+# Copy all source code
+COPY apps/ ./apps/
+COPY libs/ ./libs/ 2>/dev/null || true
+
+# Build only the api-gateway app (not all services)
+RUN npx nest build api-gateway
+
+# --- Runner stage ---
+FROM node:20-alpine AS runner
+
+WORKDIR /app
+
+COPY --from=builder /app/package*.json ./
+RUN npm ci --only=production --legacy-peer-deps
+
+# Copy compiled JavaScript output
+COPY --from=builder /app/dist/apps/api-gateway ./dist
+
+EXPOSE 3000
+
+CMD ["node", "dist/main"]

@@ -1,0 +1,309 @@
+# =============================================================================
+# DOCKER COMPOSE — Mobile Device Store Learning Stack
+# =============================================================================
+#
+# Run everything with ONE command:  docker-compose up
+#
+# What starts up and WHY each service exists:
+#
+#   postgres          — Stores devices, variants, users, orders (the "real" data)
+#   redis             — Caches product data so we don't hammer postgres every request
+#   rabbitmq          — Message queue: order events flow async between services
+#   elasticsearch     — Stores ALL log events in a searchable format
+#   logstash          — Reads logs from our NestJS apps, parses them, sends to elasticsearch
+#   kibana            — Visual dashboard to search/explore logs in elasticsearch
+#   api-gateway       — The main NestJS HTTP API (port 3000)
+#   inventory-service — RabbitMQ consumer: deducts stock on order.created
+#   notification-svc  — RabbitMQ consumer: mock email/SMS on order.confirmed
+#   analytics-service — RabbitMQ consumer: increments order count on order.completed
+#   frontend          — Angular dev server (port 4200)
+#
+# =============================================================================
+
+version: '3.8'
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # POSTGRESQL — Primary Relational Database
+  # ---------------------------------------------------------------------------
+  # Stores: users, devices, device_variants, orders, order_events
+  # Why PostgreSQL? Relational data with JOINs — perfect for showing N+1 problems
+  # Connect with: psql -h localhost -p 5432 -U postgres -d elk_store
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: elk_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-elk_store}
+    ports:
+      - '5432:5432'           # expose so you can connect with pgAdmin or psql
+    volumes:
+      - postgres_data:/var/lib/postgresql/data  # persist data between restarts
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # REDIS — In-Memory Cache + Session Store
+  # ---------------------------------------------------------------------------
+  # Caches: product listing (5min TTL), product detail (10min TTL), JWT sessions
+  # Why Redis? It's 100-1000x faster than PostgreSQL for repeated reads
+  # Connect with: redis-cli -h localhost -p 6379
+  # See active keys: redis-cli KEYS '*'
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: elk_redis
+    ports:
+      - '6379:6379'           # expose so you can inspect cache with redis-cli
+    volumes:
+      - redis_data:/data      # persist cache between restarts (optional for dev)
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # RABBITMQ — Message Broker
+  # ---------------------------------------------------------------------------
+  # Handles: order.created → order.confirmed → order.completed pipeline
+  # Why RabbitMQ? Decouples services — api-gateway doesn't wait for stock checks
+  #
+  # Management UI: http://localhost:15672  (login: guest / guest)
+  # This is one of the BEST visual tools in this stack — you can see:
+  #   - Queue depth (how many messages are waiting)
+  #   - Messages being published and consumed in real time
+  #   - Dead letter queues (failed messages)
+  # ---------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3-management-alpine   # -management tag adds the web UI
+    container_name: elk_rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-guest}
+    ports:
+      - '5672:5672'           # AMQP protocol port (apps connect here)
+      - '15672:15672'         # Management UI port (browser connects here)
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # ELASTICSEARCH — Log Storage & Search Engine
+  # ---------------------------------------------------------------------------
+  # Stores every structured log event from all NestJS services
+  # Why Elasticsearch? It can search millions of log lines in milliseconds
+  # REST API: http://localhost:9200
+  # ---------------------------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: elk_elasticsearch
+    environment:
+      - discovery.type=single-node          # single node mode (no cluster setup needed)
+      - xpack.security.enabled=false        # disable auth for local dev simplicity
+      - 'ES_JAVA_OPTS=-Xms512m -Xmx512m'   # limit RAM usage (important on dev machines)
+    ports:
+      - '9200:9200'
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -s http://localhost:9200/_cluster/health | grep -q "\"status\":\"green\"\|\"status\":\"yellow\""']
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # LOGSTASH — Log Pipeline (NestJS → Logstash → Elasticsearch)
+  # ---------------------------------------------------------------------------
+  # Reads JSON logs from our NestJS apps (via TCP), parses fields, forwards to ES
+  # Think of it as a funnel: messy logs in, clean structured data out
+  # ---------------------------------------------------------------------------
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.13.0
+    container_name: elk_logstash
+    ports:
+      - '5044:5044'           # Beats input (unused here but standard)
+      - '5000:5000/tcp'       # TCP input — NestJS sends logs here
+      - '5000:5000/udp'
+      - '9600:9600'           # Logstash monitoring API
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline  # our pipeline config
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      LS_JAVA_OPTS: '-Xmx256m -Xms256m'    # limit RAM usage
+
+  # ---------------------------------------------------------------------------
+  # KIBANA — Log Visualization Dashboard
+  # ---------------------------------------------------------------------------
+  # Web UI to explore logs stored in Elasticsearch
+  # Access: http://localhost:5601
+  #
+  # First-time setup:
+  #   1. Open http://localhost:5601
+  #   2. Go to Management → Stack Management → Index Patterns
+  #   3. Create index pattern: logstash-*  (matches all our log indices)
+  #   4. Now go to Discover to see all logs!
+  # ---------------------------------------------------------------------------
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.0
+    container_name: elk_kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - '5601:5601'           # web UI
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -s http://localhost:5601/api/status | grep -q "\"level\":\"available\""']
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # API GATEWAY — Main NestJS HTTP Service
+  # ---------------------------------------------------------------------------
+  # The ONLY service the Angular frontend talks to
+  # All other backend services communicate via RabbitMQ (no direct HTTP between them)
+  # ---------------------------------------------------------------------------
+  api-gateway:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.api-gateway
+    container_name: elk_api_gateway
+    ports:
+      - '3000:3000'
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-elk_store}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+      - JWT_SECRET=${JWT_SECRET:-supersecretjwtkey_changeme_in_production}
+      - LOGSTASH_HOST=logstash
+      - LOGSTASH_PORT=5000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # INVENTORY SERVICE — RabbitMQ Consumer #1
+  # ---------------------------------------------------------------------------
+  inventory-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.inventory-service
+    container_name: elk_inventory
+    ports:
+      - '3001:3001'
+    environment:
+      - NODE_ENV=development
+      - PORT=3001
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-elk_store}
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+      - LOGSTASH_HOST=logstash
+      - LOGSTASH_PORT=5000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # NOTIFICATION SERVICE — RabbitMQ Consumer #2
+  # ---------------------------------------------------------------------------
+  notification-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.notification-service
+    container_name: elk_notification
+    ports:
+      - '3002:3002'
+    environment:
+      - NODE_ENV=development
+      - PORT=3002
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+      - LOGSTASH_HOST=logstash
+      - LOGSTASH_PORT=5000
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # ANALYTICS SERVICE — RabbitMQ Consumer #3
+  # ---------------------------------------------------------------------------
+  analytics-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.analytics-service
+    container_name: elk_analytics
+    ports:
+      - '3003:3003'
+    environment:
+      - NODE_ENV=development
+      - PORT=3003
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-elk_store}
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+      - LOGSTASH_HOST=logstash
+      - LOGSTASH_PORT=5000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # FRONTEND — Angular Dev Server
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: elk_frontend
+    ports:
+      - '4200:4200'
+    environment:
+      - API_URL=http://localhost:3000
+    depends_on:
+      - api-gateway
+
+# =============================================================================
+# NAMED VOLUMES — Docker managed persistent storage
+# =============================================================================
+# These volumes survive container restarts so your data isn't lost
+# To reset everything: docker-compose down -v  (the -v flag deletes volumes too)
+# =============================================================================
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  elasticsearch_data:

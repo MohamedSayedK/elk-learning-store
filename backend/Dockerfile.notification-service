@@ -1,0 +1,17 @@
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+COPY nest-cli.json ./
+COPY tsconfig*.json ./
+RUN npm ci --legacy-peer-deps
+COPY apps/ ./apps/
+COPY libs/ ./libs/ 2>/dev/null || true
+RUN npx nest build notification-service
+
+FROM node:20-alpine AS runner
+WORKDIR /app
+COPY --from=builder /app/package*.json ./
+RUN npm ci --only=production --legacy-peer-deps
+COPY --from=builder /app/dist/apps/notification-service ./dist
+EXPOSE 3002
+CMD ["node", "dist/main"]
