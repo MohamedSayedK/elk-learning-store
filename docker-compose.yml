@@ -2,10 +2,29 @@
 # DOCKER COMPOSE — Mobile Device Store Learning Stack
 # =============================================================================
 #
-# Run everything with ONE command:  docker-compose up
+# WHAT IS DOCKER COMPOSE?
+#   Docker runs single containers. Docker Compose runs MULTIPLE containers
+#   that work together as one system — defined in this single file.
 #
-# What starts up and WHY each service exists:
+# HOW TO USE:
+#   docker-compose up          → start everything (foreground, see all logs)
+#   docker-compose up -d       → start everything (background/detached)
+#   docker-compose down        → stop and remove containers
+#   docker-compose down -v     → stop + delete all data volumes (full reset)
+#   docker-compose logs -f     → tail logs from all services
+#   docker-compose ps          → show running containers and their ports
 #
+# WHAT IS A CONTAINER?
+#   A lightweight isolated process. Like a mini virtual machine, but faster.
+#   Each service below gets its own container — isolated filesystem, network, process.
+#
+# HOW DO CONTAINERS TALK TO EACH OTHER?
+#   Docker Compose creates a private network for all services in this file.
+#   Services find each other by SERVICE NAME (e.g. 'postgres', 'redis').
+#   That's why NestJS connects to host: 'postgres' not host: 'localhost'.
+#   'localhost' inside a container = that container itself, not other containers.
+#
+# SERVICES IN THIS FILE:
 #   postgres          — Stores devices, variants, users, orders (the "real" data)
 #   redis             — Caches product data so we don't hammer postgres every request
 #   rabbitmq          — Message queue: order events flow async between services
@@ -16,7 +35,7 @@
 #   inventory-service — RabbitMQ consumer: deducts stock on order.created
 #   notification-svc  — RabbitMQ consumer: mock email/SMS on order.confirmed
 #   analytics-service — RabbitMQ consumer: increments order count on order.completed
-#   frontend          — Angular dev server (port 4200)
+#   frontend          — Angular dev server
 #
 # =============================================================================
 
@@ -25,147 +44,332 @@ services:
   # ---------------------------------------------------------------------------
   # POSTGRESQL — Primary Relational Database
   # ---------------------------------------------------------------------------
-  # Stores: users, devices, device_variants, orders, order_events
-  # Why PostgreSQL? Relational data with JOINs — perfect for showing N+1 problems
-  # Connect with: psql -h localhost -p 5432 -U postgres -d elk_store
+  # WHY POSTGRESQL?
+  #   Relational database — stores structured data in tables with rows and columns.
+  #   Perfect for this project because devices have variants (foreign keys),
+  #   users have orders (joins), orders have events (one-to-many relationships).
+  #   Also best for demonstrating the N+1 query problem visually.
+  #
+  # CONNECT FROM YOUR MACHINE (outside Docker):
+  #   psql -h localhost -p 5432 -U postgres -d elk_store
+  #   OR use TablePlus / pgAdmin pointing to localhost:5432
   # ---------------------------------------------------------------------------
   postgres:
+
+    # image: what Docker image to download and run
+    # 'postgres:16-alpine' means PostgreSQL version 16, Alpine Linux base
+    # Alpine = tiny Linux distro (~5MB) — makes images much smaller
+    # Format: image-name:tag  (tag = version or variant)
     image: postgres:16-alpine
+
+    # container_name: the name Docker assigns to the running container
+    # Without this, Docker generates a random name like 'elklearning_postgres_1'
+    # With this, you can run: docker exec -it elk_postgres psql ...
     container_name: elk_postgres
+
+    # environment: sets environment variables INSIDE the container
+    # PostgreSQL reads these on first startup to create the database
     environment:
+      # POSTGRES_USER: the superuser account created on first run
+      # ${POSTGRES_USER:-postgres} means:
+      #   → use $POSTGRES_USER from .env file if it exists
+      #   → fall back to 'postgres' if not set
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
+
+      # POSTGRES_PASSWORD: password for the superuser
+      # In production this would be a long random secret stored in a vault
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+
+      # POSTGRES_DB: name of the default database to create
+      # Our NestJS app connects to this database
       POSTGRES_DB: ${POSTGRES_DB:-elk_store}
+
+    # ports: maps container port → your machine port
+    # Format: "HOST_PORT:CONTAINER_PORT"
+    # '5432:5432' means: your machine's port 5432 → container's port 5432
+    # This is what lets you connect from outside Docker (psql, pgAdmin, etc.)
+    # If you had two postgres containers you'd do '5433:5432' for the second one
     ports:
-      - '5432:5432'           # expose so you can connect with pgAdmin or psql
+      - "5432:5432"
+
+    # volumes: persistent storage that survives container restarts
+    # Without volumes, ALL data is lost when the container stops
+    # 'postgres_data' is a named volume defined at the bottom of this file
+    # Docker manages its location on your filesystem automatically
     volumes:
-      - postgres_data:/var/lib/postgresql/data  # persist data between restarts
+      - postgres_data:/var/lib/postgresql/data  # /var/lib/postgresql/data = where postgres stores its files
+
+    # healthcheck: Docker periodically runs this command to check if the service is ready
+    # Other services use 'depends_on condition: service_healthy' to wait for this
+    # Without healthcheck, NestJS might start before postgres is ready → connection error
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      # test: the command to run. Exit 0 = healthy. Exit 1 = unhealthy.
+      # pg_isready = postgres built-in tool that checks if the server accepts connections
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      # interval: how often to run the check (every 5 seconds)
       interval: 5s
+      # timeout: how long to wait for the check to respond before marking it failed
       timeout: 5s
+      # retries: how many consecutive failures before marking the container 'unhealthy'
       retries: 5
 
   # ---------------------------------------------------------------------------
   # REDIS — In-Memory Cache + Session Store
   # ---------------------------------------------------------------------------
-  # Caches: product listing (5min TTL), product detail (10min TTL), JWT sessions
-  # Why Redis? It's 100-1000x faster than PostgreSQL for repeated reads
-  # Connect with: redis-cli -h localhost -p 6379
-  # See active keys: redis-cli KEYS '*'
+  # WHY REDIS?
+  #   Redis stores data IN MEMORY (RAM) instead of on disk.
+  #   RAM access = nanoseconds. Disk access = milliseconds. ~1000x faster.
+  #
+  #   We use Redis for 3 things:
+  #   1. Product listing cache (key: 'products:listing', TTL: 5 min)
+  #      → First request hits PostgreSQL (slow). Redis stores the result.
+  #      → All subsequent requests read from Redis (fast). No DB query.
+  #   2. Product detail cache (key: 'products:detail:{id}', TTL: 10 min)
+  #   3. JWT session store (key: 'session:{userId}', TTL: 24h)
+  #      → Lets us invalidate sessions server-side (logout actually works)
+  #
+  # CONNECT FROM YOUR MACHINE:
+  #   redis-cli -h localhost -p 6379
+  #   redis-cli -h localhost KEYS '*'       → see all cached keys
+  #   redis-cli -h localhost GET products:listing  → see cached product data
   # ---------------------------------------------------------------------------
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine  # Redis version 7, Alpine Linux base
+
     container_name: elk_redis
+
     ports:
-      - '6379:6379'           # expose so you can inspect cache with redis-cli
+      - "6379:6379"  # default Redis port — expose so redis-cli works from your machine
+
     volumes:
-      - redis_data:/data      # persist cache between restarts (optional for dev)
+      - redis_data:/data  # persist cache between restarts (Redis can dump to disk as backup)
+
     healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
+      # 'redis-cli ping' → Redis replies 'PONG' if healthy
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
 
   # ---------------------------------------------------------------------------
-  # RABBITMQ — Message Broker
+  # RABBITMQ — Message Broker / Queue System
   # ---------------------------------------------------------------------------
-  # Handles: order.created → order.confirmed → order.completed pipeline
-  # Why RabbitMQ? Decouples services — api-gateway doesn't wait for stock checks
+  # WHY RABBITMQ?
+  #   Without RabbitMQ: api-gateway would call inventory-service directly (HTTP).
+  #   Problem: if inventory-service is slow or down, the customer waits or gets an error.
   #
-  # Management UI: http://localhost:15672  (login: guest / guest)
-  # This is one of the BEST visual tools in this stack — you can see:
-  #   - Queue depth (how many messages are waiting)
-  #   - Messages being published and consumed in real time
-  #   - Dead letter queues (failed messages)
+  #   With RabbitMQ: api-gateway drops a message in a queue and immediately responds
+  #   to the customer. Inventory-service picks up the message whenever it's ready.
+  #   Customer never waits for stock processing. Services are DECOUPLED.
+  #
+  #   Our pipeline:
+  #   POST /orders → [order.created] → inventory → [order.confirmed] → notification
+  #               → [order.completed] → analytics
+  #
+  # TWO PORTS:
+  #   5672  = AMQP protocol (how apps CONNECT to RabbitMQ to send/receive messages)
+  #   15672 = Management UI (browser dashboard to SEE queues, messages, consumers)
+  #
+  # MANAGEMENT UI: http://localhost:15672  (login: guest / guest)
+  #   This is the best visual tool for understanding RabbitMQ:
+  #   - See queue names and message counts
+  #   - Watch messages appear when you place an order
+  #   - Watch counts drop as consumers process them
+  #   - See dead-letter queues (messages that failed processing)
   # ---------------------------------------------------------------------------
   rabbitmq:
-    image: rabbitmq:3-management-alpine   # -management tag adds the web UI
+    # rabbitmq:3-management-alpine
+    # '3'          = RabbitMQ version 3
+    # 'management' = includes the web management UI (adds the 15672 port)
+    # 'alpine'     = small base image
+    # Without 'management' tag: no web UI, only the AMQP port
+    image: rabbitmq:3-management-alpine
+
     container_name: elk_rabbitmq
+
     environment:
+      # Default credentials for the management UI and AMQP connections
+      # 'guest' only works for localhost connections by default
+      # In production you'd create a separate user with limited permissions
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-guest}
+
     ports:
-      - '5672:5672'           # AMQP protocol port (apps connect here)
-      - '15672:15672'         # Management UI port (browser connects here)
+      - "5672:5672"    # AMQP port — NestJS connects here to publish/consume messages
+      - "15672:15672"  # Management UI — open in browser to see queues visually
+
     volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
+      - rabbitmq_data:/var/lib/rabbitmq  # persist queue definitions between restarts
+
     healthcheck:
-      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
-      interval: 10s
+      # rabbitmq-diagnostics ping = checks if RabbitMQ is accepting connections
+      # -q = quiet mode (no extra output, just exit code)
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s   # RabbitMQ takes longer to start than postgres/redis
       timeout: 5s
       retries: 5
 
   # ---------------------------------------------------------------------------
-  # ELASTICSEARCH — Log Storage & Search Engine
+  # ELASTICSEARCH — Search Engine / Log Storage
   # ---------------------------------------------------------------------------
-  # Stores every structured log event from all NestJS services
-  # Why Elasticsearch? It can search millions of log lines in milliseconds
+  # WHY ELASTICSEARCH?
+  #   Every action in our app generates a log event (product viewed, order placed,
+  #   cache hit, slow query detected, etc.). We need to:
+  #   - Store millions of log lines efficiently
+  #   - Search them instantly ("show me all orders placed in the last hour")
+  #   - Aggregate them ("how many cache misses per minute?")
+  #
+  #   A regular database (postgres) is bad at this because:
+  #   - Full-text search is slow without special indexes
+  #   - Time-series aggregations are complex queries
+  #   - Writes are slow under high log volume
+  #
+  #   Elasticsearch is built specifically for search and analytics.
+  #   It stores data as JSON documents in "indices" (like tables, but schema-flexible).
+  #   Our logs go into a daily index: logstash-2026.05.20
+  #
   # REST API: http://localhost:9200
+  #   GET http://localhost:9200/_cluster/health  → cluster status
+  #   GET http://localhost:9200/_cat/indices     → list all indices
   # ---------------------------------------------------------------------------
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    # Note: elastic images come from elastic's own registry, not Docker Hub
+    # That's why the image name starts with 'docker.elastic.co/...'
+
     container_name: elk_elasticsearch
+
     environment:
-      - discovery.type=single-node          # single node mode (no cluster setup needed)
-      - xpack.security.enabled=false        # disable auth for local dev simplicity
-      - 'ES_JAVA_OPTS=-Xms512m -Xmx512m'   # limit RAM usage (important on dev machines)
+      # discovery.type=single-node: run as a standalone server, not part of a cluster
+      # By default ES tries to find other ES nodes to form a cluster
+      # For local dev we only have one node — this skips the cluster setup
+      - discovery.type=single-node
+
+      # xpack.security.enabled=false: disable username/password for Elasticsearch
+      # In production you'd enable this and set passwords
+      # For local dev we disable it so Kibana and Logstash can connect without credentials
+      - xpack.security.enabled=false
+
+      # ES_JAVA_OPTS: Java memory settings (Elasticsearch runs on the JVM)
+      # -Xms512m = minimum heap size (start with 512MB)
+      # -Xmx512m = maximum heap size (never exceed 512MB)
+      # Without this limit, ES tries to use 50% of your machine's RAM
+      # On a dev machine with 16GB RAM that's 8GB just for one container — too much
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+
     ports:
-      - '9200:9200'
+      - "9200:9200"  # REST API port — how Kibana, Logstash, and NestJS talk to ES
+
     volumes:
-      - elasticsearch_data:/usr/share/elasticsearch/data
+      - elasticsearch_data:/usr/share/elasticsearch/data  # persist indexed logs
+
     healthcheck:
-      test: ['CMD-SHELL', 'curl -s http://localhost:9200/_cluster/health | grep -q "\"status\":\"green\"\|\"status\":\"yellow\""']
-      interval: 15s
+      # Check if ES cluster is green or yellow (both mean healthy)
+      # 'red' means data loss / serious problem
+      test:
+        [
+          "CMD-SHELL",
+          'curl -s http://localhost:9200/_cluster/health | grep -q "\"status\":\"green\"\|\"status\":\"yellow\""',
+        ]
+      interval: 15s   # ES takes ~30-60 seconds to start — check less frequently
       timeout: 10s
-      retries: 10
+      retries: 10     # be patient — ES is the slowest to start in this stack
 
   # ---------------------------------------------------------------------------
-  # LOGSTASH — Log Pipeline (NestJS → Logstash → Elasticsearch)
+  # LOGSTASH — Log Ingestion Pipeline
   # ---------------------------------------------------------------------------
-  # Reads JSON logs from our NestJS apps (via TCP), parses fields, forwards to ES
-  # Think of it as a funnel: messy logs in, clean structured data out
+  # WHY LOGSTASH?
+  #   NestJS apps produce JSON logs. But they don't connect to Elasticsearch directly.
+  #   Logstash sits in the middle as a pipeline:
+  #
+  #   NestJS (Winston) → TCP:5000 → Logstash → Elasticsearch
+  #
+  #   Logstash's job:
+  #   1. INPUT:  receive log lines from NestJS via TCP on port 5000
+  #   2. FILTER: parse JSON, extract fields, add computed fields (environment, etc.)
+  #   3. OUTPUT: write clean structured documents to Elasticsearch
+  #
+  #   You define this pipeline in: logstash/pipeline/logstash.conf
+  #   The file is MOUNTED into the container (see volumes below)
+  #
+  # PORTS:
+  #   5000 = TCP input (NestJS sends logs here)
+  #   5044 = Beats input (for Filebeat/Metricbeat — not used here but standard)
+  #   9600 = Logstash monitoring API (check pipeline stats)
   # ---------------------------------------------------------------------------
   logstash:
     image: docker.elastic.co/logstash/logstash:8.13.0
+
     container_name: elk_logstash
+
     ports:
-      - '5044:5044'           # Beats input (unused here but standard)
-      - '5000:5000/tcp'       # TCP input — NestJS sends logs here
-      - '5000:5000/udp'
-      - '9600:9600'           # Logstash monitoring API
+      - "5044:5044"      # Beats protocol input (not used but standard to expose)
+      - "5000:5000/tcp"  # TCP input — NestJS Winston transport sends here
+      - "5000:5000/udp"  # UDP input — alternative protocol (lower overhead, no guarantee)
+      - "9600:9600"      # Logstash monitoring API
+
     volumes:
-      - ./logstash/pipeline:/usr/share/logstash/pipeline  # our pipeline config
+      # Mount our pipeline config file INTO the container
+      # LEFT side  = path on YOUR machine (relative to docker-compose.yml)
+      # RIGHT side = path INSIDE the container
+      # Logstash reads /usr/share/logstash/pipeline/*.conf on startup
+      - ./logstash/pipeline:/usr/share/logstash/pipeline
+
+    # depends_on: don't start this service until 'elasticsearch' passes its healthcheck
+    # Logstash needs ES to be ready before it can start indexing logs
     depends_on:
       elasticsearch:
-        condition: service_healthy
+        condition: service_healthy  # wait for ES healthcheck to pass, not just container start
+
     environment:
-      LS_JAVA_OPTS: '-Xmx256m -Xms256m'    # limit RAM usage
+      # LS_JAVA_OPTS: same as ES — limit Java heap to prevent RAM hogging
+      LS_JAVA_OPTS: "-Xmx256m -Xms256m"
 
   # ---------------------------------------------------------------------------
   # KIBANA — Log Visualization Dashboard
   # ---------------------------------------------------------------------------
-  # Web UI to explore logs stored in Elasticsearch
-  # Access: http://localhost:5601
+  # WHY KIBANA?
+  #   Elasticsearch stores logs as raw JSON. Kibana makes them VISUAL:
+  #   - Discover: browse and search all log events
+  #   - Visualize: build charts (orders per minute, cache hit rate, etc.)
+  #   - Dashboard: combine multiple charts in one view
   #
-  # First-time setup:
+  #   Think of it like:
+  #   Elasticsearch = the database (stores data)
+  #   Kibana        = the BI tool (visualizes data)
+  #
+  # ACCESS: http://localhost:5601
+  #
+  # FIRST TIME SETUP (run once after docker-compose up):
   #   1. Open http://localhost:5601
-  #   2. Go to Management → Stack Management → Index Patterns
-  #   3. Create index pattern: logstash-*  (matches all our log indices)
-  #   4. Now go to Discover to see all logs!
+  #   2. Stack Management → Index Patterns → Create index pattern
+  #   3. Pattern: logstash-*   Time field: @timestamp   → Create
+  #   4. Go to Discover → you'll see all log events!
   # ---------------------------------------------------------------------------
   kibana:
     image: docker.elastic.co/kibana/kibana:8.13.0
+
     container_name: elk_kibana
+
     environment:
+      # Tell Kibana where Elasticsearch lives
+      # 'elasticsearch' = the service name in this file → Docker resolves it to the container's IP
       - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+
     ports:
-      - '5601:5601'           # web UI
+      - "5601:5601"  # Kibana web UI
+
     depends_on:
       elasticsearch:
-        condition: service_healthy
+        condition: service_healthy  # Kibana can't work without ES — wait for it
+
     healthcheck:
-      test: ['CMD-SHELL', 'curl -s http://localhost:5601/api/status | grep -q "\"level\":\"available\""']
+      # Check Kibana's status API — 'available' means fully loaded
+      test:
+        [
+          "CMD-SHELL",
+          'curl -s http://localhost:5601/api/status | grep -q "\"level\":\"available\""',
+        ]
       interval: 15s
       timeout: 10s
       retries: 10
@@ -173,59 +377,109 @@ services:
   # ---------------------------------------------------------------------------
   # API GATEWAY — Main NestJS HTTP Service
   # ---------------------------------------------------------------------------
-  # The ONLY service the Angular frontend talks to
-  # All other backend services communicate via RabbitMQ (no direct HTTP between them)
+  # WHY "GATEWAY"?
+  #   In microservice architecture, a gateway is the single entry point.
+  #   The Angular frontend only knows about ONE URL: http://localhost:3000
+  #   All routes (products, auth, orders, health) go through this one service.
+  #   The gateway then communicates with other services via RabbitMQ — never directly.
+  #
+  # This is the ONLY service with HTTP ports exposed to Angular.
   # ---------------------------------------------------------------------------
   api-gateway:
+
+    # build: instead of pulling a pre-built image, BUILD one from our source code
     build:
+      # context: the directory to send to Docker as the "build context"
+      # Docker can only access files WITHIN this directory during the build
+      # We use ./backend because all NestJS code lives there
       context: ./backend
+
+      # dockerfile: which Dockerfile to use (relative to context)
+      # We have separate Dockerfiles per service so each builds only its own app
       dockerfile: Dockerfile.api-gateway
+
     container_name: elk_api_gateway
+
     ports:
-      - '3000:3000'
+      - "3000:3000"  # Angular calls http://localhost:3000 → this container's port 3000
+
+    # environment: all the config variables NestJS reads via ConfigService / process.env
     environment:
       - NODE_ENV=development
+
       - PORT=3000
+
+      # Database connection — 'postgres' is the SERVICE NAME from this file
+      # Docker's internal DNS resolves 'postgres' → the postgres container's IP
+      # You CANNOT use 'localhost' here — localhost inside this container = this container
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
       - POSTGRES_DB=${POSTGRES_DB:-elk_store}
+
+      # Redis connection — same pattern, use service name not localhost
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+
+      # RabbitMQ connection string
+      # Format: amqp://user:password@host:port
+      # 'rabbitmq' = service name, resolved by Docker DNS
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+
+      # JWT secret — used to sign and verify authentication tokens
+      # CHANGE THIS in any real environment — a leaked secret = forged tokens
       - JWT_SECRET=${JWT_SECRET:-supersecretjwtkey_changeme_in_production}
+
+      # Logstash connection — NestJS Winston sends logs to this host:port
       - LOGSTASH_HOST=logstash
       - LOGSTASH_PORT=5000
+
+    # depends_on: start this container ONLY AFTER these services are healthy
+    # Without this, NestJS would crash trying to connect to postgres before it's ready
     depends_on:
       postgres:
-        condition: service_healthy
+        condition: service_healthy   # wait for pg_isready to pass
       redis:
-        condition: service_healthy
+        condition: service_healthy   # wait for redis-cli ping to pass
       rabbitmq:
-        condition: service_healthy
+        condition: service_healthy   # wait for rabbitmq-diagnostics ping to pass
 
   # ---------------------------------------------------------------------------
   # INVENTORY SERVICE — RabbitMQ Consumer #1
+  # ---------------------------------------------------------------------------
+  # Consumes: order.created queue
+  # Does:     deducts stock_count from device_variants table
+  # Produces: order.confirmed (success) or order.failed (out of stock)
+  #
+  # NO HTTP PORT exposed to the outside world — pure queue consumer
+  # Port 3001 exists only for internal health checks
   # ---------------------------------------------------------------------------
   inventory-service:
     build:
       context: ./backend
       dockerfile: Dockerfile.inventory-service
+
     container_name: elk_inventory
+
     ports:
-      - '3001:3001'
+      - "3001:3001"  # internal only — not called by Angular, only used for health checks
+
     environment:
       - NODE_ENV=development
       - PORT=3001
+      # Needs postgres: updates stock_count and order status
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
       - POSTGRES_DB=${POSTGRES_DB:-elk_store}
+      # Needs rabbitmq: consumes order.created, publishes order.confirmed/failed
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+      # Needs logstash: sends queue_event_consumed log events
       - LOGSTASH_HOST=logstash
       - LOGSTASH_PORT=5000
+
     depends_on:
       postgres:
         condition: service_healthy
@@ -235,19 +489,30 @@ services:
   # ---------------------------------------------------------------------------
   # NOTIFICATION SERVICE — RabbitMQ Consumer #2
   # ---------------------------------------------------------------------------
+  # Consumes: order.confirmed queue
+  # Does:     logs a mock email/SMS notification (no real sending)
+  # Produces: order.completed queue
+  #
+  # Does NOT need postgres — it only logs, doesn't write to DB
+  # ---------------------------------------------------------------------------
   notification-service:
     build:
       context: ./backend
       dockerfile: Dockerfile.notification-service
+
     container_name: elk_notification
+
     ports:
-      - '3002:3002'
+      - "3002:3002"
+
     environment:
       - NODE_ENV=development
       - PORT=3002
+      # Only needs rabbitmq and logstash — no database access
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
       - LOGSTASH_HOST=logstash
       - LOGSTASH_PORT=5000
+
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -255,16 +520,24 @@ services:
   # ---------------------------------------------------------------------------
   # ANALYTICS SERVICE — RabbitMQ Consumer #3
   # ---------------------------------------------------------------------------
+  # Consumes: order.completed queue
+  # Does:     increments order count aggregates in postgres
+  # Produces: nothing (end of pipeline)
+  # ---------------------------------------------------------------------------
   analytics-service:
     build:
       context: ./backend
       dockerfile: Dockerfile.analytics-service
+
     container_name: elk_analytics
+
     ports:
-      - '3003:3003'
+      - "3003:3003"
+
     environment:
       - NODE_ENV=development
       - PORT=3003
+      # Needs postgres: writes order count stats
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
@@ -273,6 +546,7 @@ services:
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
       - LOGSTASH_HOST=logstash
       - LOGSTASH_PORT=5000
+
     depends_on:
       postgres:
         condition: service_healthy
@@ -280,28 +554,55 @@ services:
         condition: service_healthy
 
   # ---------------------------------------------------------------------------
-  # FRONTEND — Angular Dev Server
+  # FRONTEND — Angular Development Server
+  # ---------------------------------------------------------------------------
+  # Serves the Angular app at http://localhost:4200
+  # Calls api-gateway at http://localhost:3000
+  #
+  # In production you'd build Angular into static files and serve via nginx.
+  # For development, Angular's built-in dev server (ng serve) is easier —
+  # it hot-reloads when you change code.
   # ---------------------------------------------------------------------------
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+
     container_name: elk_frontend
+
     ports:
-      - '4200:4200'
+      - "4200:4200"  # Angular dev server
+
     environment:
+      # Angular reads this to know where to send API calls
       - API_URL=http://localhost:3000
+
     depends_on:
-      - api-gateway
+      - api-gateway  # no healthcheck needed — we just want api-gateway started first
 
 # =============================================================================
-# NAMED VOLUMES — Docker managed persistent storage
+# NAMED VOLUMES — Persistent Storage
 # =============================================================================
-# These volumes survive container restarts so your data isn't lost
-# To reset everything: docker-compose down -v  (the -v flag deletes volumes too)
+# Named volumes are managed by Docker (not a specific path on your machine).
+# They survive container restarts and removals — data persists until YOU delete them.
+#
+# View all volumes:  docker volume ls
+# Inspect a volume:  docker volume inspect elk-learning_postgres_data
+# Delete a volume:   docker volume rm elk-learning_postgres_data
+#
+# To wipe EVERYTHING and start fresh:
+#   docker-compose down -v
+#   (the -v flag tells compose to delete all volumes defined here)
 # =============================================================================
 volumes:
+  # PostgreSQL data — all your tables, rows, indexes
   postgres_data:
+
+  # Redis data — in-memory cache periodically snapshotted to disk
   redis_data:
+
+  # RabbitMQ data — queue definitions, messages not yet consumed
   rabbitmq_data:
+
+  # Elasticsearch data — all indexed log documents
   elasticsearch_data:
